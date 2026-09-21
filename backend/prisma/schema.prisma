@@ -1,0 +1,82 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  OWNER
+  EDITOR
+  VIEWER
+}
+
+model User {
+  id           String           @id @default(uuid())
+  email        String           @unique
+  passwordHash String           @map("password_hash")
+  createdAt    DateTime         @default(now()) @map("created_at")
+  
+  documents    Document[]       
+  accesses     DocumentAccess[] 
+
+  @@map("users") // Đổi tên bảng thành số nhiều, snake_case
+}
+
+model Document {
+  id        String           @id @default(uuid())
+  ownerId   String           @map("owner_id")
+  title     String
+  createdAt DateTime         @default(now()) @map("created_at")
+  updatedAt DateTime         @updatedAt @map("updated_at")
+
+  owner     User             @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  accesses  DocumentAccess[]
+  events    DocumentEvent[]
+  snapshots DocumentSnapshot[]
+
+  @@index([ownerId])
+  @@map("documents")
+}
+
+model DocumentEvent {
+  id         BigInt   @id @default(autoincrement())
+  documentId String   @map("document_id")
+  updateData Bytes    @map("update_data")
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  document   Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+
+  @@index([documentId, id])
+  @@map("document_events")
+}
+
+model DocumentSnapshot {
+  id           String   @id @default(uuid())
+  documentId   String   @map("document_id")
+  snapshotData Bytes    @map("snapshot_data")
+  version      Int
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  document     Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+
+  @@index([documentId, version])
+  @@map("document_snapshots")
+}
+
+model DocumentAccess {
+  id         String   @id @default(uuid())
+  documentId String   @map("document_id")
+  userId     String   @map("user_id")
+  role       Role     @default(VIEWER)
+  
+  document   Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([documentId, userId]) 
+
+  @@index([userId])
+  @@map("document_access")
+}

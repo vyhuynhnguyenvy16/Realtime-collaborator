@@ -1,0 +1,27 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: collab-postgres
+    restart: unless-stopped
+    environment:
+      # TODO(task-02): dùng biến môi trường thay vì ghi cứng thông tin database.
+      # Đáp án: ${POSTGRES_USER}, ${POSTGRES_PASSWORD}, ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      # TODO(task-02): map port PostgreSQL mặc định ra máy local.
+      # Đáp án: "${POSTGRES_PORT}:5432"
+      - "${POSTGRES_PORT}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      # TODO(task-02): kiểm tra database đã sẵn sàng nhận kết nối.
+      # Đáp án: pg_isready với user và database từ biến môi trường.
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:
