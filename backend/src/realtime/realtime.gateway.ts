@@ -43,7 +43,7 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
       // Xác thực token và lưu userId vào object client
       const payload = this.jwtService.verify(token, { secret: process.env.JWT_ACCESS_SECRET });
       (client as any).userId = payload.sub;
-    } catch (err) {
+    } catch {
       client.close(1008, 'Unauthorized'); // Đóng kết nối lập tức nếu token sai
     }
   }
@@ -145,7 +145,7 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
           data: { documentId, update: Array.from(awarenessState) },
         }));
       }
-    } catch (error) {
+    } catch {
       client.send(JSON.stringify({ event: 'error', data: { message: 'Forbidden' } }));
       client.close(1008, 'Forbidden');
     }
