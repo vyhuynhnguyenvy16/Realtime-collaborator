@@ -169,7 +169,7 @@ http://localhost:3000
 Các lệnh khác:
 
 ```bash
-npm run start       # chạy development một lần
+npm run start:local # chạy development một lần (npm start dùng cho production)
 npm run build       # compile TypeScript
 npm run start:prod  # chạy bản đã build trong dist/
 npm run lint        # kiểm tra lint

@@ -10,7 +10,11 @@ Redis is optional: a single instance does not need it, which keeps the bill low.
 | `api`    | This folder (`backend/`), built by Railpack  |
 | Postgres | Railway PostgreSQL template                  |
 
-`railway.json` sets the build (`npm run build` = `prisma generate && nest build`),
+Railpack's defaults are enough: it runs `npm run build` and then `npm start`
+(`prisma migrate deploy && node dist/main`). For local development use
+`npm run start:dev` (watch) or `npm run start:local`.
+
+`railway.json` (Railway is phasing this format out after 2026-12-01) also sets the build (`npm run build` = `prisma generate && nest build`),
 the start command (`npm run start:prod` = `prisma migrate deploy && node dist/main`),
 the `/health` check, and **App Sleeping**: the API sleeps when nobody uses it and
 wakes on the next request (a few seconds of cold start).
