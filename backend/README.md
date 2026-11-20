@@ -9,6 +9,39 @@ Backend NestJS cho ứng dụng cộng tác tài liệu thời gian thực. Hệ
 - Vitest cho unit/integration test
 - Testcontainers cho integration test với PostgreSQL và Redis thật
 
+## API
+
+All routes except `/health`, `/auth/register`, `/auth/login` and `/auth/refresh` need
+`Authorization: Bearer <accessToken>`.
+
+| Method | Path | Notes |
+|--------|------|-------|
+| GET | `/health` | `{ status, database }`, no user data |
+| POST | `/auth/register` | `{ email, password, name? }` → tokens |
+| POST | `/auth/login` | → `{ accessToken, refreshToken }` |
+| POST | `/auth/refresh` | `{ refreshToken }` → `{ accessToken }` |
+| POST | `/auth/logout` | revokes every refresh token of the user |
+| GET / PATCH | `/auth/me` | profile `{ id, email, name }`; PATCH `{ name }` |
+| GET | `/documents` | my documents with `role` and `owner` |
+| POST | `/documents` | `{ title }` |
+| GET | `/documents/:id` | document, my `role`, members with email/name; 404 vs 403 |
+| PATCH | `/documents/:id` | `{ title }` (owner, editor) |
+| DELETE | `/documents/:id` | owner only |
+| POST | `/documents/:id/share` | `{ email \| userId, role: EDITOR \| VIEWER }` (owner) |
+| DELETE | `/documents/:id/access/:userId` | owner removes someone, or a member leaves |
+| GET | `/documents/:id/versions` | saved and automatic versions |
+| POST | `/documents/:id/versions` | `{ label? }` save the current content |
+| GET | `/documents/:id/versions/:versionId` | Yjs `state` for a preview |
+| POST | `/documents/:id/versions/:versionId/restore` | restores it for everyone |
+
+WebSocket: `ws(s)://<host>/realtime?token=<accessToken>`, frames `{ event, data }`.
+Client sends `join {documentId, yjsClientId}`, `update {documentId, update, id?}`,
+`awareness {documentId, update}`. Server sends `sync {state, role}`, `update`,
+`awareness`, `ack {id}`, `role {role}`, `meta {title}`, `error {message}`.
+Viewers cannot send updates. Close code 1008 means `Unauthorized` or `Forbidden`.
+
+Deploying: see [DEPLOY.md](DEPLOY.md).
+
 ## 1. Yêu cầu môi trường
 
 Cài các phần mềm sau trước khi chạy project:
@@ -136,7 +169,7 @@ http://localhost:3000
 Các lệnh khác:
 
 ```bash
-npm run start       # chạy development một lần
+npm run start:local # chạy development một lần (npm start dùng cho production)
 npm run build       # compile TypeScript
 npm run start:prod  # chạy bản đã build trong dist/
 npm run lint        # kiểm tra lint

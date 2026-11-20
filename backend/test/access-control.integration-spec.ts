@@ -1,5 +1,6 @@
 import { ForbiddenException } from '@nestjs/common';
 import { Role } from '@prisma/client';
+import { DocumentEventsService } from '../src/documents/document-events.service.js';
 import { DocumentsService } from '../src/documents/documents.service.js';
 import { PrismaService } from '../src/prisma/prisma.service.js';
 import { setupTestContainers, type TestContainerEnvironment } from './test-utils/testcontainers-setup.js';
@@ -13,7 +14,7 @@ beforeAll(async () => {
   process.env.DATABASE_URL = containers.databaseUrl;
   prisma = new PrismaService();
   await prisma.$connect();
-  documentsService = new DocumentsService(prisma);
+  documentsService = new DocumentsService(prisma, new DocumentEventsService());
 });
 
 afterAll(async () => {

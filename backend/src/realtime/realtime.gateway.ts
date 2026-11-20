@@ -1,205 +1,279 @@
+import { Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
+import { JwtService } from '@nestjs/jwt';
 import {
-  WebSocketGateway,
+  ConnectedSocket,
+  MessageBody,
   OnGatewayConnection,
   OnGatewayDisconnect,
   SubscribeMessage,
-  MessageBody,
-  ConnectedSocket,
+  WebSocketGateway,
 } from '@nestjs/websockets';
-import { IncomingMessage } from 'http';
-import * as Y from 'yjs';
-import { WebSocket } from 'ws';
-import { JwtService } from '@nestjs/jwt';
-import { DocumentsService } from '../documents/documents.service.js';
-import { YjsDocumentManager } from './yjs-document-manager.service.js';
-import { RedisSyncService } from './redis-sync.service.js';
 import { Role } from '@prisma/client';
+import { IncomingMessage } from 'http';
+import { Subscription } from 'rxjs';
+import { WebSocket } from 'ws';
+import * as Y from 'yjs';
+import { accessSecret } from '../auth/auth.service.js';
+import { DocumentChange, DocumentEventsService } from '../documents/document-events.service.js';
+import { DocumentsService } from '../documents/documents.service.js';
+import { RedisSyncService } from './redis-sync.service.js';
+import { YjsDocumentManager } from './yjs-document-manager.service.js';
 
+type ClientMeta = { documentId: string; userId: string; role: Role; yjsClientId?: number };
+type AuthedSocket = WebSocket & { userId?: string; isAlive?: boolean };
+type UpdatePayload = { documentId: string; update: number[]; id?: number };
+
+const MAX_UPDATE_BYTES = 2 * 1024 * 1024;
+const HEARTBEAT_MS = 30_000;
+
+/**
+ * Frames are JSON `{ event, data }` (NestJS WsAdapter).
+ * Client → server: join, update, awareness.
+ * Server → client: sync, update, awareness, ack, role, meta, error.
+ * Close code 1008 with reason "Unauthorized" or "Forbidden".
+ */
 @WebSocketGateway({ path: '/realtime' })
-export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect {
+export class RealtimeGateway
+  implements OnGatewayConnection, OnGatewayDisconnect, OnModuleInit, OnModuleDestroy
+{
+  private readonly logger = new Logger(RealtimeGateway.name);
+  private clientMeta = new Map<WebSocket, ClientMeta>();
+  private rooms = new Map<string, Set<WebSocket>>();
+  private subscription?: Subscription;
+  private heartbeat?: NodeJS.Timeout;
+
   constructor(
     private yjsManager: YjsDocumentManager,
     private documentsService: DocumentsService,
+    private documentEvents: DocumentEventsService,
     private jwtService: JwtService,
     private redisSync: RedisSyncService,
   ) {}
 
-  private clientMeta = new Map<WebSocket, { documentId: string; userId: string; yjsClientId?: number }>();
-  private rooms = new Map<string, Set<WebSocket>>();
-
-  async handleConnection(client: WebSocket, request: IncomingMessage) {
-    try {
-      if (!request.url) {
-        client.close(1008, 'Missing socket URL');
-        return;
+  onModuleInit() {
+    this.subscription = this.documentEvents.changes.subscribe((change) => this.onDocumentChange(change));
+    // Railway and most proxies drop idle sockets; ping keeps them open and finds dead ones.
+    this.heartbeat = setInterval(() => {
+      for (const client of this.clientMeta.keys() as Iterable<AuthedSocket>) {
+        if (client.isAlive === false) {
+          client.terminate();
+          continue;
+        }
+        client.isAlive = false;
+        client.ping();
       }
+    }, HEARTBEAT_MS);
+  }
 
-      // Lấy JWT từ query string: ws://localhost:3000/realtime?token=...
-      const url = new URL(request.url, 'http://localhost');
+  onModuleDestroy() {
+    this.subscription?.unsubscribe();
+    if (this.heartbeat) clearInterval(this.heartbeat);
+  }
+
+  handleConnection(client: AuthedSocket, request: IncomingMessage) {
+    try {
+      const url = new URL(request.url ?? '', 'http://localhost');
       const token = url.searchParams.get('token');
-
       if (!token) throw new Error('Missing token');
 
-      // Xác thực token và lưu userId vào object client
-      const payload = this.jwtService.verify(token, { secret: process.env.JWT_ACCESS_SECRET });
-      (client as any).userId = payload.sub;
+      const payload = this.jwtService.verify<{ sub: string }>(token, { secret: accessSecret() });
+      client.userId = payload.sub;
+      client.isAlive = true;
+      client.on('pong', () => {
+        client.isAlive = true;
+      });
     } catch {
-      client.close(1008, 'Unauthorized'); // Đóng kết nối lập tức nếu token sai
+      client.close(1008, 'Unauthorized');
     }
   }
 
   handleDisconnect(client: WebSocket) {
     const meta = this.clientMeta.get(client);
-    if (meta) {
-      const { documentId, yjsClientId } = meta;
-      const room = this.rooms.get(documentId);
+    if (!meta) return;
+    this.clientMeta.delete(client);
 
-      if (yjsClientId !== undefined && room) {
-        const removalUpdate = this.yjsManager.removeClientAwareness(documentId, yjsClientId);
+    const { documentId, yjsClientId } = meta;
+    const room = this.rooms.get(documentId);
 
-        const broadcastMessage = JSON.stringify({
-          event: 'awareness',
-          data: { documentId, update: Array.from(removalUpdate) },
-        });
-
-        for (const c of room) {
-          if (c !== client && c.readyState === WebSocket.OPEN) {
-            c.send(broadcastMessage);
-          }
-        }
-
-        void this.redisSync.publishUpdate(documentId, removalUpdate, 'awareness');
+    if (yjsClientId !== undefined && room) {
+      const removal = this.yjsManager.removeClientAwareness(documentId, yjsClientId);
+      if (removal) {
+        this.broadcast(documentId, 'awareness', { documentId, update: Array.from(removal) }, client);
+        void this.redisSync.publishUpdate(documentId, removal, 'awareness');
       }
+    }
 
-      if (room) {
-        room.delete(client);
-        if (room.size === 0) {
-          this.rooms.delete(documentId);
-          void this.redisSync.unsubscribeDocument(documentId);
-        }
+    if (room) {
+      room.delete(client);
+      if (room.size === 0) {
+        this.rooms.delete(documentId);
+        void this.redisSync.unsubscribeDocument(documentId);
+        void this.yjsManager.compactAndEvict(documentId, () => this.rooms.has(documentId));
       }
-      this.clientMeta.delete(client);
     }
   }
 
   @SubscribeMessage('join')
   async handleJoin(
-    @ConnectedSocket() client: WebSocket,
+    @ConnectedSocket() client: AuthedSocket,
     @MessageBody() payload: { documentId: string; yjsClientId?: number },
   ) {
-    const userId = (client as any).userId;
-    const { documentId, yjsClientId } = payload;
+    const userId = client.userId;
+    const documentId = payload?.documentId;
+    if (!userId || typeof documentId !== 'string') {
+      client.close(1008, 'Unauthorized');
+      return;
+    }
 
+    let role: Role;
     try {
-      await this.documentsService.checkAccess(documentId, userId, [Role.OWNER, Role.EDITOR, Role.VIEWER]);
-
-      this.clientMeta.set(client, { documentId, userId, yjsClientId });
-
-      const room = this.rooms.get(documentId) ?? new Set<WebSocket>();
-      const isFirstClient = room.size === 0;
-      room.add(client);
-      this.rooms.set(documentId, room);
-
-      if (isFirstClient) {
-        await this.redisSync.subscribeDocument(documentId, {
-          onUpdate: (update) => {
-            this.yjsManager.applyUpdate(documentId, update, 'redis');
-            const broadcast = JSON.stringify({
-              event: 'update',
-              data: { documentId, update: Array.from(update) },
-            });
-
-            for (const c of room) {
-              if (c.readyState === WebSocket.OPEN) {
-                c.send(broadcast);
-              }
-            }
-          },
-          onAwareness: (update) => {
-            this.yjsManager.applyAwarenessUpdate(documentId, update, 'redis');
-            const broadcast = JSON.stringify({
-              event: 'awareness',
-              data: { documentId, update: Array.from(update) },
-            });
-
-            for (const c of room) {
-              if (c.readyState === WebSocket.OPEN) {
-                c.send(broadcast);
-              }
-            }
-          },
-        });
-      }
-
-      const doc = await this.yjsManager.getOrCreate(documentId);
-      const state = Y.encodeStateAsUpdate(doc);
-      client.send(JSON.stringify({
-        event: 'sync',
-        data: { documentId, state: Array.from(state) },
-      }));
-
-      const awarenessState = this.yjsManager.encodeFullAwarenessState(documentId);
-      if (awarenessState.byteLength > 0) {
-        client.send(JSON.stringify({
-          event: 'awareness',
-          data: { documentId, update: Array.from(awarenessState) },
-        }));
-      }
+      const access = await this.documentsService.checkAccess(documentId, userId, [
+        Role.OWNER,
+        Role.EDITOR,
+        Role.VIEWER,
+      ]);
+      role = access.role;
     } catch {
-      client.send(JSON.stringify({ event: 'error', data: { message: 'Forbidden' } }));
+      this.send(client, 'error', { message: 'Forbidden' });
       client.close(1008, 'Forbidden');
+      return;
+    }
+
+    // Load first, so no update can land on an empty in-memory document.
+    const doc = await this.yjsManager.getOrCreate(documentId);
+    if (client.readyState !== WebSocket.OPEN) return;
+
+    const yjsClientId = typeof payload.yjsClientId === 'number' ? payload.yjsClientId : undefined;
+    this.clientMeta.set(client, { documentId, userId, role, yjsClientId });
+
+    const room = this.rooms.get(documentId) ?? new Set<WebSocket>();
+    const isFirstClient = room.size === 0;
+    room.add(client);
+    this.rooms.set(documentId, room);
+
+    if (isFirstClient) {
+      await this.redisSync.subscribeDocument(documentId, {
+        onUpdate: (update) => {
+          this.yjsManager.applyUpdate(documentId, update, 'redis');
+          this.broadcast(documentId, 'update', { documentId, update: Array.from(update) });
+        },
+        onAwareness: (update) => {
+          this.yjsManager.applyAwarenessUpdate(documentId, update, 'redis');
+          this.broadcast(documentId, 'awareness', { documentId, update: Array.from(update) });
+        },
+      });
+    }
+
+    this.send(client, 'sync', {
+      documentId,
+      role,
+      state: Array.from(Y.encodeStateAsUpdate(doc)),
+    });
+
+    const awarenessState = this.yjsManager.encodeFullAwarenessState(documentId);
+    if (awarenessState.byteLength > 0) {
+      this.send(client, 'awareness', { documentId, update: Array.from(awarenessState) });
     }
   }
 
   @SubscribeMessage('update')
-  handleUpdate(@ConnectedSocket() client: WebSocket, @MessageBody() payload: { documentId: string; update: number[] }) {
+  async handleUpdate(@ConnectedSocket() client: WebSocket, @MessageBody() payload: UpdatePayload) {
     const meta = this.clientMeta.get(client);
-    if (!meta || meta.documentId !== payload.documentId) return;
+    if (!meta || meta.documentId !== payload?.documentId || !Array.isArray(payload.update)) return;
 
-    const updateArray = new Uint8Array(payload.update);
-    this.yjsManager.applyUpdate(payload.documentId, updateArray, 'local');
-    void this.yjsManager.persistUpdate(payload.documentId, updateArray).catch((error) => {
-      console.error('Persist update failed:', error);
-    });
+    if (meta.role === Role.VIEWER) {
+      this.send(client, 'error', { message: 'ReadOnly', id: payload.id });
+      return;
+    }
+    if (payload.update.length > MAX_UPDATE_BYTES) {
+      this.send(client, 'error', { message: 'TooLarge', id: payload.id });
+      return;
+    }
 
-    void this.redisSync.publishUpdate(payload.documentId, updateArray, 'update');
+    const update = new Uint8Array(payload.update);
+    try {
+      this.yjsManager.applyUpdate(meta.documentId, update, 'local');
+    } catch {
+      this.send(client, 'error', { message: 'BadUpdate', id: payload.id });
+      return;
+    }
 
-    const room = this.rooms.get(payload.documentId);
-    if (room) {
-      const broadcastMessage = JSON.stringify({
-        event: 'update',
-        data: { documentId: payload.documentId, update: payload.update },
-      });
+    this.broadcast(meta.documentId, 'update', { documentId: meta.documentId, update: payload.update }, client);
+    void this.redisSync.publishUpdate(meta.documentId, update, 'update');
 
-      for (const c of room) {
-        if (c !== client && c.readyState === WebSocket.OPEN) {
-          c.send(broadcastMessage);
-        }
-      }
+    try {
+      await this.yjsManager.persistUpdate(meta.documentId, update);
+      // Tells the sender its change is stored, so the UI can show "Đã lưu".
+      if (payload.id !== undefined) this.send(client, 'ack', { documentId: meta.documentId, id: payload.id });
+    } catch (error) {
+      this.logger.error(`Persist update failed: ${String(error)}`);
+      this.send(client, 'error', { message: 'PersistFailed', id: payload.id });
     }
   }
 
   @SubscribeMessage('awareness')
-  handleAwareness(@ConnectedSocket() client: WebSocket, @MessageBody() payload: { documentId: string; update: number[] }) {
+  handleAwareness(@ConnectedSocket() client: WebSocket, @MessageBody() payload: UpdatePayload) {
     const meta = this.clientMeta.get(client);
-    if (!meta || meta.documentId !== payload.documentId) return;
+    if (!meta || meta.documentId !== payload?.documentId || !Array.isArray(payload.update)) return;
 
-    const updateArray = new Uint8Array(payload.update);
-    this.yjsManager.applyAwarenessUpdate(payload.documentId, updateArray, client);
-    void this.redisSync.publishUpdate(payload.documentId, updateArray, 'awareness');
+    const update = new Uint8Array(payload.update);
+    try {
+      this.yjsManager.applyAwarenessUpdate(meta.documentId, update, client);
+    } catch {
+      return;
+    }
+    void this.redisSync.publishUpdate(meta.documentId, update, 'awareness');
+    this.broadcast(meta.documentId, 'awareness', { documentId: meta.documentId, update: payload.update }, client);
+  }
 
-    const room = this.rooms.get(payload.documentId);
-    if (room) {
-      const broadcastMessage = JSON.stringify({
-        event: 'awareness',
-        data: { documentId: payload.documentId, update: payload.update },
-      });
+  /** Sends an update made on the server (e.g. a restored version) to everyone. */
+  async broadcastServerUpdate(documentId: string, update: Uint8Array) {
+    this.broadcast(documentId, 'update', { documentId, update: Array.from(update) });
+    void this.redisSync.publishUpdate(documentId, update, 'update');
+    await this.yjsManager.persistUpdate(documentId, update);
+    if (!this.rooms.has(documentId)) {
+      void this.yjsManager.compactAndEvict(documentId, () => this.rooms.has(documentId));
+    }
+  }
 
-      for (const c of room) {
-        if (c !== client && c.readyState === WebSocket.OPEN) {
-          c.send(broadcastMessage);
+  private onDocumentChange(change: DocumentChange) {
+    const room = this.rooms.get(change.documentId);
+
+    switch (change.type) {
+      case 'renamed':
+        this.broadcast(change.documentId, 'meta', { documentId: change.documentId, title: change.title });
+        return;
+      case 'role-changed':
+        for (const client of room ?? []) {
+          const meta = this.clientMeta.get(client);
+          if (meta?.userId === change.userId) {
+            meta.role = change.role as Role;
+            this.send(client, 'role', { documentId: change.documentId, role: change.role });
+          }
         }
-      }
+        return;
+      case 'access-revoked':
+        for (const client of [...(room ?? [])]) {
+          if (this.clientMeta.get(client)?.userId === change.userId) client.close(1008, 'Forbidden');
+        }
+        return;
+      case 'deleted':
+        for (const client of [...(room ?? [])]) client.close(1008, 'Forbidden');
+        this.yjsManager.evict(change.documentId);
+        return;
+    }
+  }
+
+  private send(client: WebSocket, event: string, data: unknown) {
+    if (client.readyState === WebSocket.OPEN) client.send(JSON.stringify({ event, data }));
+  }
+
+  private broadcast(documentId: string, event: string, data: unknown, except?: WebSocket) {
+    const room = this.rooms.get(documentId);
+    if (!room) return;
+    const message = JSON.stringify({ event, data });
+    for (const client of room) {
+      if (client !== except && client.readyState === WebSocket.OPEN) client.send(message);
     }
   }
 }

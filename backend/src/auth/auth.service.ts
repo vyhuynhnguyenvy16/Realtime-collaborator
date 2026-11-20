@@ -1,6 +1,7 @@
 import {
   ConflictException,
   Injectable,
+  NotFoundException,
   UnauthorizedException,
 } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
@@ -8,12 +9,23 @@ import bcrypt from 'bcrypt';
 import { PrismaService } from '../prisma/prisma.service.js';
 import { RegisterDto } from './dto/register.dto.js';
 
-type AuthUser = { id: string; email: string };
+type TokenUser = { id: string; email: string; tokenVersion: number };
 
-type TokenPayload = {
-  sub: string;
-  email: string;
-};
+type RefreshPayload = { sub: string; email: string; ver?: number };
+
+const PROFILE = { id: true, email: true, name: true, createdAt: true } as const;
+
+export function accessSecret(): string {
+  const secret = process.env.JWT_ACCESS_SECRET;
+  if (!secret) throw new Error('JWT_ACCESS_SECRET is not configured');
+  return secret;
+}
+
+function refreshSecret(): string {
+  const secret = process.env.JWT_REFRESH_SECRET;
+  if (!secret) throw new Error('JWT_REFRESH_SECRET is not configured');
+  return secret;
+}
 
 @Injectable()
 export class AuthService {
@@ -23,95 +35,89 @@ export class AuthService {
   ) {}
 
   async register(dto: RegisterDto) {
-    const existingUser = await this.prisma.user.findUnique({
-      where: { email: dto.email },
-    });
-
+    const email = dto.email.trim().toLowerCase();
+    const existingUser = await this.prisma.user.findUnique({ where: { email } });
     if (existingUser) {
       throw new ConflictException('Email đã tồn tại');
     }
 
     const passwordHash = await bcrypt.hash(dto.password, 12);
     const user = await this.prisma.user.create({
-      data: {
-        email: dto.email,
-        passwordHash,
-      },
-      select: {
-        id: true,
-        email: true,
-      },
+      data: { email, passwordHash, name: dto.name?.trim() || null },
+      select: { id: true, email: true, tokenVersion: true },
     });
 
     return this.generateTokens(user);
   }
 
-  async validateUser(email: string, password: string): Promise<AuthUser> {
-    const user = await this.prisma.user.findUnique({ where: { email } });
+  async validateUser(email: string, password: string): Promise<TokenUser> {
+    const user = await this.prisma.user.findUnique({
+      where: { email: email.trim().toLowerCase() },
+    });
 
     if (!user || !(await bcrypt.compare(password, user.passwordHash))) {
       throw new UnauthorizedException('Email hoặc mật khẩu không đúng');
     }
 
-    return { id: user.id, email: user.email };
+    return { id: user.id, email: user.email, tokenVersion: user.tokenVersion };
   }
 
-  login(user: AuthUser) {
+  login(user: TokenUser) {
     return this.generateTokens(user);
   }
 
-  refresh(refreshToken: string) {
+  async refresh(refreshToken: string) {
+    let payload: RefreshPayload;
     try {
-      const payload = this.jwtService.verify<TokenPayload>(refreshToken, {
-        secret: this.getRefreshSecret(),
-      });
-
-      if (!payload.sub || !payload.email) {
-        throw new UnauthorizedException('Refresh token không hợp lệ');
-      }
-
-      const accessToken = this.jwtService.sign(
-        { sub: payload.sub, email: payload.email },
-        {
-          secret: this.getAccessSecret(),
-          expiresIn: '15m',
-        },
-      );
-
-      return { accessToken };
+      payload = this.jwtService.verify<RefreshPayload>(refreshToken, { secret: refreshSecret() });
     } catch {
       throw new UnauthorizedException('Refresh token không hợp lệ hoặc đã hết hạn');
     }
-  }
 
-  private generateTokens(user: AuthUser) {
-    const payload: TokenPayload = { sub: user.id, email: user.email };
-
-    const accessToken = this.jwtService.sign(payload, {
-      secret: this.getAccessSecret(),
-      expiresIn: '15m',
+    const user = await this.prisma.user.findUnique({
+      where: { id: payload.sub },
+      select: { id: true, email: true, tokenVersion: true },
     });
-    const refreshToken = this.jwtService.sign(payload, {
-      secret: this.getRefreshSecret(),
-      expiresIn: '7d',
+    if (!user || (payload.ver ?? 0) !== user.tokenVersion) {
+      throw new UnauthorizedException('Phiên đăng nhập đã kết thúc');
+    }
+
+    return { accessToken: this.signAccess(user) };
+  }
+
+  async logout(userId: string) {
+    await this.prisma.user.update({
+      where: { id: userId },
+      data: { tokenVersion: { increment: 1 } },
     });
-
-    return { accessToken, refreshToken };
   }
 
-  private getAccessSecret(): string {
-    const secret = process.env.JWT_ACCESS_SECRET;
-    if (!secret) {
-      throw new Error('JWT_ACCESS_SECRET is not configured');
-    }
-    return secret;
+  async profile(userId: string) {
+    const user = await this.prisma.user.findUnique({ where: { id: userId }, select: PROFILE });
+    if (!user) throw new NotFoundException('User không tồn tại');
+    return user;
   }
 
-  private getRefreshSecret(): string {
-    const secret = process.env.JWT_REFRESH_SECRET;
-    if (!secret) {
-      throw new Error('JWT_REFRESH_SECRET is not configured');
-    }
-    return secret;
+  updateProfile(userId: string, name: string) {
+    return this.prisma.user.update({
+      where: { id: userId },
+      data: { name: name.trim() },
+      select: PROFILE,
+    });
+  }
+
+  private signAccess(user: { id: string; email: string }) {
+    return this.jwtService.sign(
+      { sub: user.id, email: user.email },
+      { secret: accessSecret(), expiresIn: '15m' },
+    );
+  }
+
+  private generateTokens(user: TokenUser) {
+    const refreshToken = this.jwtService.sign(
+      { sub: user.id, email: user.email, ver: user.tokenVersion },
+      { secret: refreshSecret(), expiresIn: '7d' },
+    );
+    return { accessToken: this.signAccess(user), refreshToken };
   }
 }

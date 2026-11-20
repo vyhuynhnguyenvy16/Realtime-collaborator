@@ -4,7 +4,8 @@ import request from 'supertest';
 import { App } from 'supertest/types';
 import { AppModule } from './../src/app.module.js';
 
-describe('AppController (e2e)', () => {
+// Needs DATABASE_URL, JWT_ACCESS_SECRET and JWT_REFRESH_SECRET.
+describe('Health (e2e)', () => {
   let app: INestApplication<App>;
 
   beforeEach(async () => {
@@ -16,11 +17,10 @@ describe('AppController (e2e)', () => {
     await app.init();
   });
 
-  it('/ (GET)', () => {
-    return request(app.getHttpServer())
-      .get('/')
-      .expect(200)
-      .expect('Hello World!');
+  it('/health (GET) reports the database and never returns users', async () => {
+    const response = await request(app.getHttpServer()).get('/health').expect(200);
+    expect(response.body).toMatchObject({ status: 'ok', database: 'up' });
+    expect(response.body.users).toBeUndefined();
   });
 
   afterEach(async () => {
