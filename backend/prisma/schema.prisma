@@ -17,10 +17,13 @@ model User {
   id           String           @id @default(uuid())
   email        String           @unique
   passwordHash String           @map("password_hash")
+  name         String?
+  tokenVersion Int              @default(0) @map("token_version")
   createdAt    DateTime         @default(now()) @map("created_at")
-  
-  documents    Document[]       
-  accesses     DocumentAccess[] 
+
+  documents    Document[]
+  accesses     DocumentAccess[]
+  snapshots    DocumentSnapshot[]
 
   @@map("users") // Đổi tên bảng thành số nhiều, snake_case
 }
@@ -58,9 +61,12 @@ model DocumentSnapshot {
   documentId   String   @map("document_id")
   snapshotData Bytes    @map("snapshot_data")
   version      Int
+  label        String?
+  createdById  String?  @map("created_by_id")
   createdAt    DateTime @default(now()) @map("created_at")
 
   document     Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  createdBy    User?    @relation(fields: [createdById], references: [id], onDelete: SetNull)
 
   @@index([documentId, version])
   @@map("document_snapshots")

@@ -3,19 +3,21 @@ import {
   Controller,
   Delete,
   Get,
+  HttpCode,
   Param,
+  ParseUUIDPipe,
   Patch,
   Post,
   UseGuards,
 } from '@nestjs/common';
+import { CurrentUser, type AuthUser } from '../auth/current-user.decorator.js';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard.js';
-import { CurrentUser } from './current-user.decorator.js';
 import { CreateDocumentDto } from './dto/create-document.dto.js';
 import { ShareDocumentDto } from './dto/share-document.dto.js';
 import { UpdateDocumentDto } from './dto/update-document.dto.js';
 import { DocumentsService } from './documents.service.js';
 
-type AuthUser = { id: string; email: string };
+const uuid = new ParseUUIDPipe({ version: '4' });
 
 @Controller('documents')
 @UseGuards(JwtAuthGuard)
@@ -33,13 +35,13 @@ export class DocumentsController {
   }
 
   @Get(':id')
-  findOne(@Param('id') id: string, @CurrentUser() user: AuthUser) {
+  findOne(@Param('id', uuid) id: string, @CurrentUser() user: AuthUser) {
     return this.documentsService.findOneForUser(id, user.id);
   }
 
   @Patch(':id')
   update(
-    @Param('id') id: string,
+    @Param('id', uuid) id: string,
     @CurrentUser() user: AuthUser,
     @Body() dto: UpdateDocumentDto,
   ) {
@@ -47,16 +49,28 @@ export class DocumentsController {
   }
 
   @Delete(':id')
-  remove(@Param('id') id: string, @CurrentUser() user: AuthUser) {
-    return this.documentsService.remove(id, user.id);
+  @HttpCode(204)
+  async remove(@Param('id', uuid) id: string, @CurrentUser() user: AuthUser) {
+    await this.documentsService.remove(id, user.id);
   }
 
   @Post(':id/share')
   share(
-    @Param('id') id: string,
+    @Param('id', uuid) id: string,
     @CurrentUser() user: AuthUser,
     @Body() dto: ShareDocumentDto,
   ) {
-    return this.documentsService.share(id, user.id, dto.userId, dto.role);
+    return this.documentsService.share(id, user.id, dto);
+  }
+
+  /** Owner removes someone, or a member leaves a document shared with them. */
+  @Delete(':id/access/:userId')
+  @HttpCode(204)
+  async removeAccess(
+    @Param('id', uuid) id: string,
+    @Param('userId', uuid) targetUserId: string,
+    @CurrentUser() user: AuthUser,
+  ) {
+    await this.documentsService.removeAccess(id, user.id, targetUserId);
   }
 }

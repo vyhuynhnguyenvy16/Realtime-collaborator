@@ -1,21 +1,18 @@
-import { Controller, Get } from '@nestjs/common';
+import { Controller, Get, ServiceUnavailableException } from '@nestjs/common';
+import { PrismaService } from '../prisma/prisma.service.js';
 
 @Controller('health')
 export class HealthController {
+  constructor(private readonly prisma: PrismaService) {}
+
+  // Never return user rows here: this endpoint is public.
   @Get()
-  check() {
-    // TODO(task-01): trả về trạng thái để kiểm tra API đang hoạt động.
-    // Đáp án: dùng status "ok".
-    return {
-      status: 'ok',
-
-      // TODO(task-01): đặt tên định danh cho backend.
-      // Đáp án: "realtime-collaborator-api".
-      service: 'realtime-collaborator-api',
-
-      // TODO(task-01): khai báo version khởi đầu.
-      // Đáp án: "0.1.0". Task sau sẽ đọc version từ package.json.
-      version: '0.1.0',
-    };
+  async check() {
+    try {
+      await this.prisma.$queryRaw`SELECT 1`;
+    } catch {
+      throw new ServiceUnavailableException({ status: 'error', database: 'down' });
+    }
+    return { status: 'ok', service: 'realtime-collaborator-api', version: '0.2.0', database: 'up' };
   }
 }
